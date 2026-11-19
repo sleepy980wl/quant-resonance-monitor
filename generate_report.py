@@ -193,7 +193,7 @@ th{{color:#666}} .scroll{{overflow-x:auto}}
 <div class="card"><h2>微观量能广度 (TRIN)</h2>{trin_html}</div>
 <div class="card"><h2>50ETF 期权情绪</h2>{opt_html}</div>
 <div class="card"><h2>今日日内走势</h2>{intraday_table()}</div>
-<p class="muted">数据来源: AKShare（东财/新浪/期权实时行情）。仅供参考，不构成投资建议。报告由 quant_resonance_monitor v10 生成。</p>
+<p class="muted">数据来源: AKShare（东财/新浪/期权实时行情）。仅供参考，不构成投资建议。报告由 quant_resonance_monitor v11 生成。</p>
 </body></html>"""
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
