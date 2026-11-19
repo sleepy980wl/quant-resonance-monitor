@@ -6,7 +6,7 @@ A股三维量化自动监控与资金强弱评分系统（AKShare）—— Insta
 
 - 主站：Instabox VPS，每 20 分钟一期（09:30–15:05 CST），报告页见 VPS 公开链接。
 - 备份：本仓库的 GitHub Actions，交易日每 30 分钟运行一次 `generate_report.py`，生成 `report/index.html` 并提交回仓库。
-- 程序：`quant_resonance_monitor.py`（v10，含东财 push2 熔断器）+ `generate_report.py`（生成静态 HTML 报告页）。
+- 程序：`quant_resonance_monitor.py`（v11，含东财 push2 熔断器与新浪/上交所期权托底）+ `generate_report.py`（生成静态 HTML 报告页）。
 
 ## 定时
 
@@ -14,7 +14,7 @@ GitHub Actions（UTC，北京时间 = UTC+8）：
 
 - 09:37、10:07、10:37、11:07、11:37、13:07、13:37、14:07、14:37、15:07 CST，每 30 分钟
 - 15:12 CST 收盘快照
-- 仅周一至周五；节假日也会触发一次，程序会按交易日历处理（非交易日无有效数据）。
+- 仅周一至周五；法定节假日由交易日判断步骤跳过，不生成新报告。
 
 ## 本地运行
 
