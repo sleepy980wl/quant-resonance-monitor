@@ -2,18 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 A股三维量化自动监控与资金强弱评分系统 (AKShare 1.20.44+ / 旧版双兼容)
-v10: 在 v9 基础上增加跨进程东财 push2 熔断器，彻底解决定时任务 (--once) 反复撞限流、延长封禁的问题：
-1. 跨进程熔断器 (monitor_data/push2_circuit_breaker.json)：
-   - 对东财 push2 翻页接口 (option_realtime_em / stock_zh_a_spot_em) 彻底禁用快重试 (retries=1)；
-   - 一旦失败立即写入冷却截止时间（首次默认 60 分钟，连续失败指数退避至 120 分钟），
-     后续定时轮次在冷却期内直接跳过 push2 请求（不再重复试探延长封禁），到期后自动恢复探测；
-   - 新增 _PUSH2_LOCK 串行化 push2 请求，避免 TRIN 与期权并发轰炸；支持 --reset-push2 手动解除熔断。
-2. 保留 v9 的期权 25 分钟磁盘缓存 (option_rt_cache.json)、15:00 后强制拉新及当日缓存兜底。
+v11: 在 v10 基础上为期权模块增加「东财限流自动托底策略」(主路正常时不触发)：
+1. 主路不变：优先走东财 (option_realtime_em + option_value_analysis_em / option_risk_analysis_em)
+   并沿用 v10 的跨进程 push2 熔断器 (60->120分钟指数退避) 与 25 分钟磁盘缓存；
+2. 托底一层（新浪 50ETF 精准批量托底）：仅当东财 PCR 或 IV 失败/处于熔断期且无当日缓存时自动启动，
+   通过 option_sse_list_sina + option_sse_codes_sina 拿到 50ETF 合约号，用 2~4 次新浪批量行情请求
+   (CON_OP_ / CON_SO_) 直接补齐 Vol_PCR、OI_PCR 与近/次月平值 IV，完全绕过东财 262 页翻页；
+3. 托底二层（上交所官网统计）：若 PCR 仍缺失，尝试调用 option_daily_stats_sse 补齐官方认购/认沽统计；
+4. 托底三层（QVIX 60日分位降级打分）：当 PCR 与 IV 全部缺失但 QVIX 正常时，自动用 QVIX 近 60 日分位
+   给出降级期权情绪分（区间收敛在 20%~80% 并标注「期权仅QVIX降级」），避免全天 N/A。
 ====================================================================
 用法示例：
-    python quant_resonance_monitor_v10.py --once
-    python quant_resonance_monitor_v10.py --once --reset-push2
-    python quant_resonance_monitor_v10.py --watch --interval 1200
+    python quant_resonance_monitor_v11.py --once
+    python quant_resonance_monitor_v11.py --once --reset-push2
+    python quant_resonance_monitor_v11.py --watch --interval 1200
 """
 
 from __future__ import annotations
@@ -87,7 +89,7 @@ def load_index_futures_config() -> Dict[str, Dict[str, object]]:
 
 
 # ==============================================================================
-# 跨进程东财 push2 熔断器 (阻止定时 --once 任务反复撞墙延长封禁)
+# 跨进程东财 push2 熔断器
 # ==============================================================================
 _PUSH2_LOCK = threading.Lock()
 _PUSH2_CB_FILE = DATA_DIR / "push2_circuit_breaker.json"
@@ -124,7 +126,6 @@ def reset_push2_circuit_breaker() -> None:
 
 
 def push2_cooldown_info() -> Tuple[bool, int, int]:
-    """返回 (是否处于熔断期, 剩余秒数, 连续失败次数)。"""
     d = _read_push2_cb()
     blocked_until = float(d.get("blocked_until", 0.0) or 0.0)
     streak = int(d.get("streak", 0) or 0)
@@ -845,7 +846,7 @@ def compute_relative_trin_module(
 
 
 # ==============================================================================
-# 模块三：50ETF 期权 PCR 与 IV 期限结构 (v9 磁盘缓存 + v10 熔断保护)
+# 模块三：50ETF 期权 PCR 与 IV 期限结构 (东财主路 + 限流时自动启动三层托底)
 # ==============================================================================
 def _extract_atm_iv(sub_df: pd.DataFrame, iv_col: str = "隐含波动率") -> Optional[float]:
     df = sub_df.dropna(subset=[iv_col]).copy()
@@ -907,6 +908,165 @@ def _cache_is_today(cached: Dict[str, object]) -> bool:
         return False
 
 
+def _sina_batch_fetch_lines(symbols: List[str], chunk_size: int = 60) -> Dict[str, List[str]]:
+    """向新浪 hq.sinajs.cn 批量拉取合约行情（每批 60 个，全量 50ETF 仅需 2~4 次请求）。"""
+    import requests
+
+    out: Dict[str, List[str]] = {}
+    headers = {"Referer": "https://finance.sina.com.cn/"}
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        url = f"https://hq.sinajs.cn/list={','.join(chunk)}"
+        resp = requests.get(url, headers=headers, timeout=(8.0, 15.0))
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+        for line in resp.text.splitlines():
+            m = re.match(r'^var hq_str_([^=]+)="([^"]*)";', line.strip())
+            if m and m.group(2):
+                out[m.group(1)] = m.group(2).split(",")
+    return out
+
+
+def _fallback_50etf_from_sina(need_pcr: bool, need_iv: bool) -> Dict[str, object]:
+    """
+    托底一层（仅在东财失败/熔断时调用）：
+    通过新浪 50ETF 合约代码列表 + hq.sinajs.cn 批量接口获取 Vol_PCR、OI_PCR 与近/次月平值 IV。
+    """
+    fb: Dict[str, object] = {
+        "Vol_PCR": None,
+        "OI_PCR": None,
+        "近月平值IV": None,
+        "次月平值IV": None,
+        "IV_diff": None,
+    }
+    fn_list = _resolve_ak_func("option_sse_list_sina")
+    fn_codes = _resolve_ak_func("option_sse_codes_sina")
+
+    months_raw = retry_call(fn_list, retries=2, symbol="50ETF", exchange="null")
+    if isinstance(months_raw, pd.DataFrame) and "到期月份" in months_raw.columns:
+        months = [str(m).replace("-", "") for m in months_raw["到期月份"].dropna().tolist()]
+    elif isinstance(months_raw, list):
+        months = [str(m).replace("-", "") for m in months_raw]
+    else:
+        return fb
+
+    months = sorted({m[:6] for m in months if len(m) >= 6})
+    if not months:
+        return fb
+
+    # 收集 50ETF (510050) 在市全部月份的认购/认沽合约代码
+    month_codes: Dict[str, Tuple[List[str], List[str]]] = {}
+    all_calls: List[str] = []
+    all_puts: List[str] = []
+    for ym in months:
+        c_list: List[str] = []
+        p_list: List[str] = []
+        for side, target in (("看涨期权", c_list), ("看跌期权", p_list)):
+            try:
+                cdf = retry_call(fn_codes, retries=2, symbol=side, trade_date=ym, underlying="510050")
+                if isinstance(cdf, pd.DataFrame) and not cdf.empty:
+                    col = "期权代码" if "期权代码" in cdf.columns else cdf.columns[-1]
+                    codes = [re.sub(r"\D", "", str(x)) for x in cdf[col].dropna().tolist()]
+                    target.extend([c for c in codes if c])
+            except Exception:
+                continue
+        month_codes[ym] = (c_list, p_list)
+        all_calls.extend(c_list)
+        all_puts.extend(p_list)
+
+    if need_pcr and all_calls and all_puts:
+        op_syms = [f"CON_OP_{c}" for c in (all_calls + all_puts)]
+        op_data = _sina_batch_fetch_lines(op_syms)
+        c_vol = p_vol = c_oi = p_oi = 0.0
+        for code in all_calls:
+            parts = op_data.get(f"CON_OP_{code}")
+            if parts and len(parts) > 41:
+                try:
+                    c_oi += float(parts[5])
+                    c_vol += float(parts[41])
+                except ValueError:
+                    pass
+        for code in all_puts:
+            parts = op_data.get(f"CON_OP_{code}")
+            if parts and len(parts) > 41:
+                try:
+                    p_oi += float(parts[5])
+                    p_vol += float(parts[41])
+                except ValueError:
+                    pass
+        if c_vol > 0:
+            fb["Vol_PCR"] = round(p_vol / c_vol, 3)
+        if c_oi > 0:
+            fb["OI_PCR"] = round(p_oi / c_oi, 3)
+
+    if need_iv and len(months) >= 2:
+        near_m, next_m = months[0], months[1]
+        near_codes = month_codes[near_m][0] + month_codes[near_m][1]
+        next_codes = month_codes[next_m][0] + month_codes[next_m][1]
+        so_syms = [f"CON_SO_{c}" for c in (near_codes + next_codes)]
+        so_data = _sina_batch_fetch_lines(so_syms)
+
+        def _atm_iv_for(codes: List[str]) -> Optional[float]:
+            rows = []
+            for code in codes:
+                parts = so_data.get(f"CON_SO_{code}")
+                if parts and len(parts) > 9:
+                    try:
+                        delta = float(parts[5])
+                        iv = float(parts[9])
+                        if iv > 0:
+                            iv_pct = iv * 100.0 if iv < 2.0 else iv
+                            rows.append((abs(abs(delta) - 0.5), iv_pct))
+                    except ValueError:
+                        pass
+            if not rows:
+                return None
+            rows.sort(key=lambda x: x[0])
+            return float(np.mean([r[1] for r in rows[:4]]))
+
+        near_iv = _atm_iv_for(near_codes)
+        next_iv = _atm_iv_for(next_codes)
+        if near_iv is not None and next_iv is not None:
+            fb["近月平值IV"] = round(near_iv, 2)
+            fb["次月平值IV"] = round(next_iv, 2)
+            fb["IV_diff"] = round(near_iv - next_iv, 2)
+
+    return fb
+
+
+def _fallback_50etf_pcr_from_sse() -> Tuple[Optional[float], Optional[float]]:
+    """托底二层（上交所官网每日统计）：尝试补齐官方 Vol_PCR / OI_PCR。"""
+    fn = _resolve_ak_func("option_daily_stats_sse")
+    for delta_days in range(0, 5):
+        dt_str = (today_cn() - timedelta(days=delta_days)).strftime("%Y%m%d")
+        try:
+            df = retry_call(fn, retries=1, date=dt_str)
+        except Exception:
+            continue
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        mask = df.astype(str).apply(lambda col: col.str.contains("510050|50ETF", na=False)).any(axis=1)
+        sub = df[mask]
+        if sub.empty:
+            continue
+        row = sub.iloc[0]
+        vol_pcr = oi_pcr = None
+        if "认沽/认购持仓比" in row.index and pd.notna(row["认沽/认购持仓比"]):
+            raw_oi = float(pd.to_numeric(row["认沽/认购持仓比"], errors="coerce"))
+            if np.isfinite(raw_oi) and raw_oi > 0:
+                oi_pcr = round(raw_oi / 100.0 if raw_oi > 5.0 else raw_oi, 3)
+        c_col = next((c for c in row.index if "认购成交" in str(c)), None)
+        p_col = next((c for c in row.index if "认沽成交" in str(c)), None)
+        if c_col and p_col:
+            c_v = float(pd.to_numeric(row[c_col], errors="coerce"))
+            p_v = float(pd.to_numeric(row[p_col], errors="coerce"))
+            if np.isfinite(c_v) and c_v > 0 and np.isfinite(p_v):
+                vol_pcr = round(p_v / c_v, 3)
+        if vol_pcr is not None or oi_pcr is not None:
+            return vol_pcr, oi_pcr
+    return None, None
+
+
 def _fetch_rt_and_fill(
     result: Dict[str, object],
     warn_list: List[str],
@@ -948,15 +1108,23 @@ def _fetch_rt_and_fill(
 
         if result["Vol_PCR"] is not None or result["OI_PCR"] is not None:
             _save_rt_cache(result["Vol_PCR"], result["OI_PCR"], rt_name)
-            result["PCR_来源"] = "实时"
+            result["PCR_来源"] = "东财实时"
     except Exception as exc:
-        warn_list.append(f"期权Vol/OI_PCR获取失败: {exc}")
+        warn_list.append(f"东财期权PCR失败: {exc}")
         if rt_cached is not None and _cache_is_today(rt_cached):
             result["Vol_PCR"] = rt_cached["vol_pcr"]
             result["OI_PCR"] = rt_cached["oi_pcr"]
             cached_at = datetime.fromtimestamp(float(rt_cached["fetched_at"]), tz=CN_TZ).strftime("%H:%M")
-            result["PCR_来源"] = f"缓存 {cached_at}（拉取失败后兜底）"
-            warn_list.append(f"realtime_em 拉取失败，Vol/OI PCR 改用当日缓存（{cached_at}）")
+            result["PCR_来源"] = f"缓存 {cached_at}（东财失败兜底）"
+            warn_list.append(f"Vol/OI PCR 改用当日缓存（{cached_at}）")
+
+
+def _format_iv_structure(diff: float) -> str:
+    if diff > 2.0:
+        return f"近月倒挂({diff:+.2f}%, 短期恐慌)"
+    if diff < -2.0:
+        return f"正斜率({diff:+.2f}%, 情绪平稳)"
+    return f"平坦({diff:+.2f}%)"
 
 
 def compute_50etf_option_module(
@@ -966,13 +1134,14 @@ def compute_50etf_option_module(
 ) -> Dict[str, object]:
     result: Dict[str, object] = {
         "QVIX": None,
+        "QVIX_60日分位": None,
         "Vol_PCR": None,
         "OI_PCR": None,
         "近月平值IV": None,
         "次月平值IV": None,
         "IV_diff": None,
         "IV期限结构": "数据不足",
-        "PCR_来源": "实时",
+        "PCR_来源": "东财实时",
         "warnings": [],
     }
     warn_list: List[str] = []
@@ -1000,14 +1169,22 @@ def compute_50etf_option_module(
         tasks["rt"] = _fetch_rt
     fetched = run_parallel(tasks, workers=workers)
 
+    # 1. QVIX 及近 60 日历史分位 (独立源 1.optbbs.com，可作最终降级因子)
     try:
         qvix_df, qvix_exc = fetched["qvix"]
         if qvix_exc is not None:
             raise qvix_exc
-        result["QVIX"] = round(float(pd.to_numeric(qvix_df["close"].iloc[-1], errors="coerce")), 2)
+        qvix_ser = pd.to_numeric(qvix_df["close"], errors="coerce").dropna()
+        if not qvix_ser.empty:
+            cur_qvix = float(qvix_ser.iloc[-1])
+            result["QVIX"] = round(cur_qvix, 2)
+            past_q = qvix_ser.iloc[:-1].tail(60)
+            if len(past_q) >= 10:
+                result["QVIX_60日分位"] = round(float((past_q <= cur_qvix).mean()), 3)
     except Exception as exc:
         warn_list.append(f"QVIX获取失败: {exc}")
 
+    # 2. 东财主路：PCR
     if use_cache:
         result["Vol_PCR"] = rt_cached["vol_pcr"]
         result["OI_PCR"] = rt_cached["oi_pcr"]
@@ -1017,6 +1194,7 @@ def compute_50etf_option_module(
     else:
         _fetch_rt_and_fill(result, warn_list, fetched, rt_cached)
 
+    # 3. 东财主路：IV 期限结构
     try:
         val_df, val_exc = fetched["val"]
         if val_exc is not None:
@@ -1055,23 +1233,53 @@ def compute_50etf_option_module(
                 if near_iv is not None and next_iv is not None:
                     diff = near_iv - next_iv
                     result["IV_diff"] = round(diff, 2)
-                    if diff > 2.0:
-                        result["IV期限结构"] = f"近月倒挂({diff:+.2f}%, 短期恐慌)"
-                    elif diff < -2.0:
-                        result["IV期限结构"] = f"正斜率({diff:+.2f}%, 情绪平稳)"
-                    else:
-                        result["IV期限结构"] = f"平坦({diff:+.2f}%)"
+                    result["IV期限结构"] = _format_iv_structure(diff)
             else:
                 warn_list.append(f"50ETF 仅获取 {len(expiries)} 个到期月，无法计算期限结构")
     except Exception as exc:
-        warn_list.append(f"期权IV期限结构失败: {exc}")
+        warn_list.append(f"东财期权IV失败: {exc}")
+
+    # 4. 自动托底一层：仅当东财未拿到 PCR 或 IV 时，启动新浪 50ETF 精准批量托底
+    need_pcr = result["Vol_PCR"] is None
+    need_iv = result["IV_diff"] is None
+    if need_pcr or need_iv:
+        try:
+            fb = _fallback_50etf_from_sina(need_pcr=need_pcr, need_iv=need_iv)
+            if need_pcr and fb["Vol_PCR"] is not None:
+                result["Vol_PCR"] = fb["Vol_PCR"]
+                if result["OI_PCR"] is None:
+                    result["OI_PCR"] = fb["OI_PCR"]
+                result["PCR_来源"] = "新浪批量托底"
+                _save_rt_cache(result["Vol_PCR"], result["OI_PCR"], "sina_batch_fallback")
+                warn_list.append("东财限流/异常，Vol/OI PCR 已自动切换至新浪 50ETF 批量托底")
+            if need_iv and fb["IV_diff"] is not None:
+                result["近月平值IV"] = fb["近月平值IV"]
+                result["次月平值IV"] = fb["次月平值IV"]
+                result["IV_diff"] = fb["IV_diff"]
+                result["IV期限结构"] = _format_iv_structure(float(fb["IV_diff"])) + "[新浪托底]"
+                warn_list.append("东财IV异常，平值IV期限结构已自动切换至新浪托底")
+        except Exception as exc:
+            warn_list.append(f"新浪期权托底失败: {exc}")
+
+    # 5. 自动托底二层：若 PCR 仍缺失，尝试上交所官网每日统计接口
+    if result["Vol_PCR"] is None:
+        try:
+            sse_vol_pcr, sse_oi_pcr = _fallback_50etf_pcr_from_sse()
+            if sse_vol_pcr is not None:
+                result["Vol_PCR"] = sse_vol_pcr
+                if result["OI_PCR"] is None:
+                    result["OI_PCR"] = sse_oi_pcr
+                result["PCR_来源"] = "上交所官网统计托底"
+                warn_list.append("Vol/OI PCR 已切换至上交所官网每日统计托底")
+        except Exception as exc:
+            warn_list.append(f"上交所期权统计托底失败: {exc}")
 
     result["warnings"] = warn_list
     return result
 
 
 # ==============================================================================
-# 模块四：基于视频标准的「资金强弱百分比」量化打分引擎
+# 模块四：基于视频标准的「资金强弱百分比」量化打分引擎 (含 QVIX 最终降级托底)
 # ==============================================================================
 def _score_pcr(vol_pcr: float) -> float:
     if 0.70 <= vol_pcr <= 0.95:
@@ -1088,7 +1296,9 @@ def compute_capital_strength_pct(
 ) -> Dict[str, object]:
     fut_ok = bool(basis_metrics and basis_metrics.get("valid_count", 0) > 0)
     trin_ok = bool(trin_res and trin_res.get("有效家数", 0) > 0)
-    opt_ok = bool(opt_res and (opt_res.get("Vol_PCR") is not None or opt_res.get("IV_diff") is not None))
+    opt_primary_ok = bool(opt_res and (opt_res.get("Vol_PCR") is not None or opt_res.get("IV_diff") is not None))
+    opt_qvix_fallback = bool(not opt_primary_ok and opt_res and opt_res.get("QVIX_60日分位") is not None)
+    opt_ok = opt_primary_ok or opt_qvix_fallback
 
     missing_modules = []
     if not fut_ok:
@@ -1166,8 +1376,9 @@ def compute_capital_strength_pct(
 
         micro_strength_pct = clip_pct(0.45 * weight_capital_pct + 0.55 * market_breadth_pct)
 
+    # 托底三层：PCR 与 IV 全缺时，使用 QVIX 近 60 日分位输出降级期权分 (限制在 20~80%)
     option_strength_pct: Optional[float] = None
-    if opt_ok and opt_res is not None:
+    if opt_primary_ok and opt_res is not None:
         opt_parts: List[Tuple[float, float]] = []
         vol_pcr = opt_res.get("Vol_PCR")
         iv_diff = opt_res.get("IV_diff")
@@ -1178,6 +1389,10 @@ def compute_capital_strength_pct(
         if opt_parts:
             w_sum = sum(w for w, _ in opt_parts)
             option_strength_pct = clip_pct(sum(w * v for w, v in opt_parts) / w_sum)
+    elif opt_qvix_fallback and opt_res is not None:
+        qvix_pct = float(opt_res["QVIX_60日分位"])
+        # QVIX 越高恐慌越强 -> 情绪支撑分越低，映射至 [20, 80]
+        option_strength_pct = clip_pct(80.0 - qvix_pct * 60.0)
 
     weighted_sum, weight_total = 0.0, 0.0
     if futures_strength_pct is not None:
@@ -1187,11 +1402,18 @@ def compute_capital_strength_pct(
         weighted_sum += 0.40 * micro_strength_pct
         weight_total += 0.40
     if option_strength_pct is not None:
-        weighted_sum += 0.20 * option_strength_pct
-        weight_total += 0.20
+        # 仅 QVIX 降级时权重减半为 0.10，防止单指标主导
+        opt_w = 0.10 if opt_qvix_fallback else 0.20
+        weighted_sum += opt_w * option_strength_pct
+        weight_total += opt_w
 
     total_strength_pct = clip_pct(weighted_sum / weight_total) if weight_total > 0 else None
-    credibility = f"部分数据缺失({', '.join(missing_modules)})，分数降级参考" if missing_modules else "全维度数据完整"
+    if missing_modules:
+        credibility = f"部分数据缺失({', '.join(missing_modules)})，分数降级参考"
+    elif opt_qvix_fallback:
+        credibility = "全维度已出分(期权仅QVIX60日分位降级托底)"
+    else:
+        credibility = "全维度数据完整"
 
     if total_strength_pct is None:
         regime_label = "无法判定"
@@ -1353,8 +1575,10 @@ def run_once(
     if opt_err:
         print(f"  [异常] 期权模块失败: {opt_err}")
     elif opt_res:
+        qvix_p = opt_res.get("QVIX_60日分位")
+        qvix_p_str = f"({qvix_p * 100:.0f}%分位)" if isinstance(qvix_p, (int, float)) else ""
         print(
-            f"  50ETF期权[{opt_res.get('PCR_来源', '实时')}]: QVIX {opt_res['QVIX']} | "
+            f"  50ETF期权[{opt_res.get('PCR_来源', '东财实时')}]: QVIX {opt_res['QVIX']}{qvix_p_str} | "
             f"Vol_PCR {opt_res['Vol_PCR']} | OI_PCR {opt_res['OI_PCR']} | IV结构 {opt_res['IV期限结构']}"
         )
         if opt_res.get("warnings"):
@@ -1391,7 +1615,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8, help="并发线程数 (必须大于0，默认 8；1=近似串行)")
     parser.add_argument("--http-timeout", type=float, default=25.0, help="单次 HTTP 读取超时秒数 (默认 25；<=0 表示不设置)")
     parser.add_argument("--basis-ttl", type=int, default=900, help="--watch 下期货基差(日线数据)的复用秒数 (默认 900；0=每轮重算)")
-    parser.add_argument("--push2-cooldown", type=float, default=3600.0, help="东财 push2 限流后的跨进程熔断基础秒数 (默认 3600/60分钟，连续失败指数退避至2倍)")
+    parser.add_argument("--push2-cooldown", type=float, default=3600.0, help="东财 push2 限流后的跨进程熔断基础秒数 (默认 3600/60分钟)")
     parser.add_argument("--reset-push2", action="store_true", help="运行前手动清除 push2 跨进程熔断状态")
     args = parser.parse_args()
 
