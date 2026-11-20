@@ -1,1 +1,1 @@
-{"blocked_until": 1795079493.7652273, "streak": 2, "last_error": "接口 stock_zh_a_spot_em 连续 1 次调用失败: 东方财富 push2 行情服务器断开了连接，通常是短时间内请求过多，当前 IP 被临时限流。首次限流一般约 5 分钟后恢复，反复触发后可能需要 40 分钟以上；等待期间不要重复调用东方财富的行情接口，否则会延长限流。", "updated_at": "2026-11-19 15:11:33"}
+{"blocked_until": 1795149343.8211038, "streak": 3, "last_error": "接口 stock_zh_a_spot_em 连续 1 次调用失败: HTTPSConnectionPool(host='82.push2delay.eastmoney.com', port=443): Read timed out. (read timeout=8.0)", "updated_at": "2026-11-20 10:35:43"}
