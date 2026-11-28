@@ -49,6 +49,17 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "Monitor update $(date -u '+%Y-%m-%d %H:%M UTC')"
-            git pull --rebase
+            git pull --rebase || {
+              echo "Rebase conflict, keeping the newly generated report"
+              git rebase --abort || true
+              git fetch origin main
+              git reset --soft origin/main
+              git add report/index.html monitor_data/
+              if git diff --cached --quiet; then
+                echo "No changes after rebase, already up to date"
+              else
+                git commit -m "Monitor update $(date -u '+%Y-%m-%d %H:%M UTC')"
+              fi
+            }
             git push
           fi
